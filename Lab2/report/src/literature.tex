@@ -1,0 +1,493 @@
+\section{Исходная программа}
+
+{\bfseries matrix.h} 
+
+\begin{lstlisting}[language=C++]
+#ifndef MATRIX_H
+#define MATRIX_H
+
+#include <vector>
+#include <iostream>
+
+class Matrix {
+public:
+    Matrix();
+    Matrix(int rows, int cols);
+
+    int getRows() const;
+    int getCols() const;
+
+    double getValue(int row, int col) const;
+    void setValue(int row, int col, double value);
+
+    void print() const;
+    void fillFromConsole();
+
+    double applyConvolutionAt(int row, int col, const Matrix& kernel, const Matrix& source) const;
+
+private:
+    std::vector<std::vector<double>> data;
+    int rows;
+    int cols;
+};
+
+#endif
+\end{lstlisting}
+
+{\bfseries matrix.cpp} 
+
+\begin{lstlisting}[language=C++]
+#include "../include/matrix.h"
+#include <stdexcept>
+#include <iomanip>
+
+Matrix::Matrix() : rows(0), cols(0) {}
+
+Matrix::Matrix(int rows_, int cols_) : rows(rows_), cols(cols_) {
+    if (rows < 0 || cols < 0) throw std::invalid_argument("Negative matrix size");
+    data.assign(rows, std::vector<double>(cols, 0.0));
+}
+
+int Matrix::getRows() const { return rows; }
+int Matrix::getCols() const { return cols; }
+
+double Matrix::getValue(int row, int col) const {
+    if (row >= 0 && row < rows && col >= 0 && col < cols) return data[row][col];
+    return 0.0;
+}
+
+void Matrix::setValue(int row, int col, double value) {
+    if (row >= 0 && row < rows && col >= 0 && col < cols) data[row][col] = value;
+}
+
+void Matrix::print() const {
+    std::cout << "Matrix " << rows << " x " << cols << ":\n";
+    std::cout << std::fixed << std::setprecision(6);
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            std::cout << data[r][c] << "\t";
+        }
+        std::cout << "\n";
+    }
+}
+
+void Matrix::fillFromConsole() {
+    std::cout << "Input number of rows: ";
+    std::cin >> rows;
+    std::cout << "Input number of cols: ";
+    std::cin >> cols;
+    if (!std::cin || rows <= 0 || cols <= 0) {
+        throw std::invalid_argument("rows and cols must be positive integers");
+    }
+    data.assign(rows, std::vector<double>(cols));
+    std::cout << "Input matrix elements row by row (double):\n";
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            std::cin >> data[r][c];
+        }
+    }
+}
+
+double Matrix::applyConvolutionAt(int row, int col, const Matrix& kernel, const Matrix& source) const {
+    int kRows = kernel.getRows();
+    int kCols = kernel.getCols();
+    if (kRows != kCols || kRows % 2 == 0) {
+        throw std::invalid_argument("Kernel must be square with odd size");
+    }
+    int half = kRows / 2;
+    double sum = 0.0;
+    for (int kr = 0; kr < kRows; ++kr) {
+        for (int kc = 0; kc < kCols; ++kc) {
+            int srcR = row + (kr - half);
+            int srcC = col + (kc - half);
+            double srcVal = source.getValue(srcR, srcC);
+            double kval = kernel.getValue(kr, kc);
+            sum += kval * srcVal;
+        }
+    }
+    return sum;
+}
+\end{lstlisting}
+
+{\bfseries threads.h} 
+
+\begin{lstlisting}[language=C++]
+#ifndef THREADS_H
+#define THREADS_H
+
+#include <vector>
+#include <thread>
+#include <atomic>
+
+#include "matrix.h"
+
+class ThreadControl {
+public:
+    ThreadControl(int maxThreads);
+    ~ThreadControl();
+
+    bool applyConvolution(Matrix& bufferA, Matrix& bufferB, const Matrix& kernel, int iterations);
+
+private:
+    int maxThreads;
+    std::vector<std::thread> workers;
+
+    void workerFunc(const Matrix* src, Matrix* dst, const Matrix* kernel,
+                    std::atomic<int>* nextRow, int totalRows);
+};
+
+#endif
+
+\end{lstlisting}
+
+{\bfseries threads.cpp} 
+
+\begin{lstlisting}[language=C++]
+#include "../include/threads.h"
+#include <iostream>
+#include <functional>
+#include <cassert>
+
+ThreadControl::ThreadControl(int maxThreads_) : maxThreads(maxThreads_) {
+    if (maxThreads <= 0) throw std::invalid_argument("maxThreads must be positive");
+}
+
+ThreadControl::~ThreadControl() {
+    for (auto &t : workers) {
+        if (t.joinable()) t.join();
+    }
+}
+
+void ThreadControl::workerFunc(const Matrix* src, Matrix* dst, const Matrix* kernel,
+                               std::atomic<int>* nextRow, int totalRows) {
+    while (true) {
+        int row = nextRow->fetch_add(1, std::memory_order_relaxed);
+        if (row >= totalRows) break;
+        for (int col = 0; col < dst->getCols(); ++col) {
+            double v = dst->applyConvolutionAt(row, col, *kernel, *src);
+            dst->setValue(row, col, v);
+        }
+    }
+}
+
+bool ThreadControl::applyConvolution(Matrix& bufferA, Matrix& bufferB, const Matrix& kernel, int iterations) {
+    if (bufferA.getRows() != bufferB.getRows() || bufferA.getCols() != bufferB.getCols()) {
+        std::cerr << "Error: buffer sizes mismatch" << std::endl;
+        return false;
+    }
+    if (kernel.getRows() != kernel.getCols() || kernel.getRows() % 2 == 0) {
+        std::cerr << "Error: kernel must be square with odd size" << std::endl;
+        return false;
+    }
+    if (iterations <= 0) {
+        std::cerr << "Error: iterations must be positive" << std::endl;
+        return false;
+    }
+
+    Matrix* src = &bufferA;
+    Matrix* dst = &bufferB;
+
+    int rows = src->getRows();
+    int cols = src->getCols();
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        std::atomic<int> nextRow(0);
+        workers.clear();
+        workers.reserve(maxThreads);
+
+        for (int t = 0; t < maxThreads; ++t) {
+            workers.emplace_back(&ThreadControl::workerFunc, this, src, dst, &kernel, &nextRow, rows);
+        }
+
+        for (auto &th : workers) {
+            if (th.joinable()) th.join();
+        }
+        std::swap(src, dst);
+    }
+    return true;
+}
+\end{lstlisting}
+
+{\bfseries main.cpp} 
+
+\begin{lstlisting}[language=C++]
+#include <iostream>
+#include <string>
+#include <vector>
+#include <stdexcept>
+
+#include "include/matrix.h"
+#include "include/threads.h"
+
+void printUsage(const char* progName) {
+    std::cout << "Usage: " << progName << " -threads N" << std::endl;
+    std::cout << "  -threads N : maximum number of concurrent threads (required)" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Example: " << progName << " -threads 4" << std::endl;
+}
+
+int main(int argc, char* argv[]) {
+    int maxThreads = 0;
+    std::string progName = argc > 0 ? argv[0] : "conv_filter";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-threads" && i + 1 < argc) {
+            try {
+                maxThreads = std::stoi(argv[++i]);
+                if (maxThreads <= 0) {
+                    std::cerr << "Error: number of threads must be positive" << std::endl;
+                    return 1;
+                }
+            } catch (...) {
+                std::cerr << "Error: invalid thread count format" << std::endl;
+                return 1;
+            }
+        }
+    }
+
+    if (maxThreads <= 0) {
+        std::cerr << "Error: must specify number of threads" << std::endl;
+        printUsage(progName.c_str());
+        return 1;
+    }
+
+    try {
+        std::cout << "=== Convolution Filter (Variant 13) ===" << std::endl;
+        std::cout << "Max concurrent threads: " << maxThreads << std::endl;
+
+        Matrix input;
+        input.fillFromConsole();
+
+        int windowSize;
+        std::cout << "Enter window size (odd positive integer): ";
+        std::cin >> windowSize;
+        if (!std::cin || windowSize <= 0 || windowSize % 2 == 0) {
+            std::cerr << "Error: window size must be a positive odd integer." << std::endl;
+            return 1;
+        }
+
+        Matrix kernel(windowSize, windowSize);
+        std::cout << "Enter convolution kernel elements (" << windowSize << "x" << windowSize 
+                  << ") row by row (double values):" << std::endl;
+        for (int r = 0; r < windowSize; ++r) {
+            for (int c = 0; c < windowSize; ++c) {
+                double v;
+                std::cin >> v;
+                kernel.setValue(r, c, v);
+            }
+        }
+
+        int iterations;
+        std::cout << "Enter number of filter applications (K > 0): ";
+        std::cin >> iterations;
+        if (!std::cin || iterations <= 0) {
+            std::cerr << "Error: iterations must be positive." << std::endl;
+            return 1;
+        }
+
+        std::cout << "\n--- Original Matrix ---\n";
+        input.print();
+
+        Matrix bufferA = input;
+        Matrix bufferB(input.getRows(), input.getCols());
+
+        ThreadControl threadManager(maxThreads);
+
+        std::cout << "\n--- Processing ---\n";
+        std::cout << "Window size: " << windowSize << ", Iterations: " << iterations 
+                  << ", Matrix: " << input.getRows() << "x" << input.getCols() << std::endl;
+
+        bool ok = threadManager.applyConvolution(bufferA, bufferB, kernel, iterations);
+        if (!ok) {
+            std::cerr << "Error: convolution failed." << std::endl;
+            return 1;
+        }
+        Matrix& result = (iterations % 2 == 0) ? bufferA : bufferB;
+        std::cout << "\n--- Result ---\n";
+        result.print();
+
+    } catch (const std::exception& e) {
+        std::cerr << "Exception: " << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
+
+\end{lstlisting}
+
+{\bfseries Process Monitor} 
+
+\begin{lstlisting}
+Time of Day	Process Name	PID	Operation	Path	Result	Detail
+10:48.0	conv_filter.exe	2592	Process Start		SUCCESS	"Parent PID: 23236, Command line: ""C:\Workspace\OS_labs\Lab2\conv_filter.exe"" -threads 4, Current directory: C:\Workspace\OS_labs\Lab2\, Environment: 
+;	ALLUSERSPROFILE=C:\ProgramData
+;	AMDRMSDKPATH=C:\Program Files\AMD\RyzenMasterSDK\
+;	APPDATA=C:\Users\Koval\AppData\Roaming
+;	CHROME_CRASHPAD_PIPE_NAME=\\.\pipe\crashpad_16012_RPIHYOODLSVGDWUT
+;	CommonProgramFiles=C:\Program Files\Common Files
+;	CommonProgramFiles(x86)=C:\Program Files (x86)\Common Files
+;	CommonProgramW6432=C:\Program Files\Common Files
+;	COMPUTERNAME=VICTOR_PC
+;	ComSpec=C:\WINDOWS\system32\cmd.exe
+;	DriverData=C:\Windows\System32\Drivers\DriverData
+;	EFC_24480=1
+;	FPS_BROWSER_APP_PROFILE_STRING=Internet Explorer
+;	FPS_BROWSER_USER_PROFILE_STRING=Default
+;	HOMEDRIVE=C:
+;	HOMEPATH=\Users\Koval
+;	LOCALAPPDATA=C:\Users\Koval\AppData\Local
+;	LOGONSERVER=\\VICTOR_PC
+;	NUMBER_OF_PROCESSORS=12
+;	OneDrive=C:\Users\Koval\OneDrive
+;	OnlineServices=Online Services
+;	ORIGINAL_XDG_CURRENT_DESKTOP=undefined
+;	OS=Windows_NT
+;	Path=D:\BAS_labs\VMWare\bin\;c:\users\koval\gcc\bin;c:\users\koval\gcc\libexec\gcc\x86_64-w64-mingw32\14.1.0;C:\ProgramData\Oracle\Java\javapath;C:\windows\system32;C:\windows;C:\windows\System32\Wbem;C:\windows\System32\WindowsPowerShell\v1.0\;C:\windows\System32\OpenSSH\;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;C:\WINDOWS\System32\OpenSSH\;C:\Program Files\HP\HP One Agent;C:\Program Files\Git\cmd;C:\Program Files\dotnet\;C:\Program Files\CMake\bin;C:\Program Files\NVIDIA Corporation\NVIDIA App\NvDLISR;C:\Users\Koval\AppData\Local\Programs\Python\Python311\Scripts\;C:\Users\Koval\AppData\Local\Programs\Python\Python311\;C:\Users\Koval\AppData\Local\Microsoft\WindowsApps;C:\Users\Koval\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\Koval\AppData\Local\Programs\Python;C:\mingw64\bin;C:\Program Files\swipl\bin;c:\Users\Koval\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand
+;	PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL
+;	platformcode=M7
+;	PROCESSOR_ARCHITECTURE=AMD64
+;	PROCESSOR_IDENTIFIER=AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD
+;	PROCESSOR_LEVEL=25
+;	PROCESSOR_REVISION=5000
+;	ProgramData=C:\ProgramData
+;	ProgramFiles=C:\Program Files
+;	ProgramFiles(x86)=C:\Program Files (x86)
+;	ProgramW6432=C:\Program Files
+;	PSModulePath=C:\Users\Koval\OneDrive\Документы\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules
+;	PUBLIC=C:\Users\Public
+;	RegionCode=EMEA
+;	SESSIONNAME=Console
+;	SystemDrive=C:
+;	SystemRoot=C:\WINDOWS
+;	TEMP=C:\Users\Koval\AppData\Local\Temp
+;	TMP=C:\Users\Koval\AppData\Local\Temp
+;	USERDOMAIN=VICTOR_PC
+;	USERDOMAIN_ROAMINGPROFILE=VICTOR_PC
+;	USERNAME=Koval
+;	USERPROFILE=C:\Users\Koval
+;	VBOX_MSI_INSTALL_PATH=C:\Program Files\Oracle\VirtualBox\
+;	windir=C:\WINDOWS
+;	TERM_PROGRAM=vscode
+;	TERM_PROGRAM_VERSION=1.106.0
+;	LANG=ru_RU.UTF-8
+;	COLORTERM=truecolor
+;	GIT_ASKPASS=c:\Users\Koval\AppData\Local\Programs\Microsoft VS Code\resources\app\extensions\git\dist\askpass.sh
+;	VSCODE_GIT_ASKPASS_NODE=C:\Users\Koval\AppData\Local\Programs\Microsoft VS Code\Code.exe
+;	VSCODE_GIT_ASKPASS_EXTRA_ARGS=
+;	VSCODE_GIT_ASKPASS_MAIN=c:\Users\Koval\AppData\Local\Programs\Microsoft VS Code\resources\app\extensions\git\dist\askpass-main.js
+;	VSCODE_GIT_IPC_HANDLE=\\.\pipe\vscode-git-193ae1ec72-sock
+;	VSCODE_INJECTION=1
+;	VSCODE_NONCE=60414565-2bd2-4318-857c-96d1776cba3d
+;	VSCODE_A11Y_MODE=0
+;	VSCODE_STABLE=1"
+10:48.0	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 7156
+10:48.0	conv_filter.exe	2592	Load Image	C:\Workspace\OS_labs\Lab2\conv_filter.exe	SUCCESS	Image Base: 0x7ff65db80000, Image Size: 0xd96000
+10:48.0	conv_filter.exe	2592	Load Image	C:\Windows\System32\ntdll.dll	SUCCESS	Image Base: 0x7ff87efb0000, Image Size: 0x218000
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Nls\CodePage	REPARSE	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Nls\CodePage	SUCCESS	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Nls\CodePage\ACP	SUCCESS	Type: REG_SZ, Length: 10, Data: 1251
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Nls\CodePage\OEMCP	SUCCESS	Type: REG_SZ, Length: 8, Data: 866
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Nls\CodePage	SUCCESS	
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager	REPARSE	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\RaiseExceptionOnPossibleDeadlock	NAME NOT FOUND	Length: 80
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Segment Heap	REPARSE	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager\Segment Heap	NAME NOT FOUND	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\SYSTEM\CurrentControlSet\Control\Session Manager	REPARSE	Desired Access: Query Value, Enumerate Sub Keys
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	Desired Access: Query Value, Enumerate Sub Keys
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\ResourcePolicies	NAME NOT FOUND	Length: 24
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\57a6ed1a-79f7-5011-b242-4784e5620cf7	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\57a6ed1a-79f7-5011-b242-4784e5620cf7	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	QueryNameInformationFile	C:\Windows\System32\ntdll.dll	SUCCESS	Name: \Windows\System32\ntdll.dll
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\SYSTEM\CurrentControlSet\Control\Session Manager	REPARSE	Desired Access: Query Value, Enumerate Sub Keys
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	Desired Access: Query Value, Enumerate Sub Keys
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\ResourcePolicies	NAME NOT FOUND	Length: 24
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	
+10:48.0	conv_filter.exe	2592	CreateFile	C:\Workspace\OS_labs\Lab2	SUCCESS	Desired Access: Execute/Traverse, Synchronize, Disposition: Open, Options: Directory, Synchronous IO Non-Alert, Attributes: n/a, ShareMode: Read, Write, AllocationSize: n/a, OpenResult: Opened
+10:48.0	conv_filter.exe	2592	Load Image	C:\Windows\System32\kernel32.dll	SUCCESS	Image Base: 0x7ff87e2d0000, Image Size: 0xc4000
+10:48.0	conv_filter.exe	2592	Load Image	C:\Windows\System32\KernelBase.dll	SUCCESS	Image Base: 0x7ff87c870000, Image Size: 0x3d3000
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\3c74afb9-8d82-44e3-b52c-365dbf48382a	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\3c74afb9-8d82-44e3-b52c-365dbf48382a	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	QueryNameInformationFile	C:\Windows\System32\KernelBase.dll	SUCCESS	Name: \Windows\System32\KernelBase.dll
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\b749553b-d950-5e03-6282-3145a61b1002	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\b749553b-d950-5e03-6282-3145a61b1002	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	QueryNameInformationFile	C:\Windows\System32\KernelBase.dll	SUCCESS	Name: \Windows\System32\KernelBase.dll
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\StateSeparation\RedirectionMap\Keys	REPARSE	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\StateSeparation\RedirectionMap\Keys	NAME NOT FOUND	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\05f95efe-7f75-49c7-a994-60a55cc09571	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\WMI\Security\05f95efe-7f75-49c7-a994-60a55cc09571	NAME NOT FOUND	Length: 528
+10:48.0	conv_filter.exe	2592	QueryNameInformationFile	C:\Windows\System32\KernelBase.dll	SUCCESS	Name: \Windows\System32\KernelBase.dll
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Terminal Server	REPARSE	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Terminal Server	SUCCESS	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Terminal Server\TSAppCompat	NAME NOT FOUND	Length: 548
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Terminal Server\TSUserEnabled	SUCCESS	Type: REG_DWORD, Length: 4, Data: 0
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Terminal Server	SUCCESS	
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\SafeBoot\Option	REPARSE	Desired Access: Query Value, Set Value
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\SafeBoot\Option	NAME NOT FOUND	Desired Access: Query Value, Set Value
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Srp\GP\DLL	REPARSE	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Srp\GP\DLL	NAME NOT FOUND	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers	SUCCESS	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\SOFTWARE\Policies\Microsoft\Windows\safer\codeidentifiers\TransparentEnabled	NAME NOT FOUND	Length: 80
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\SOFTWARE\Policies\Microsoft\Windows\safer\codeidentifiers	SUCCESS	
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKCU\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers	NAME NOT FOUND	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\FileSystem\	REPARSE	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\FileSystem	SUCCESS	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\FileSystem\LongPathsEnabled	SUCCESS	Type: REG_DWORD, Length: 4, Data: 1
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\FileSystem\LPGO	NAME NOT FOUND	Length: 20
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\FileSystem	SUCCESS	
+10:48.0	conv_filter.exe	2592	Load Image	C:\Windows\System32\msvcrt.dll	SUCCESS	Image Base: 0x7ff87e870000, Image Size: 0xa7000
+10:48.0	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 27220
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\SYSTEM\CurrentControlSet\Control\Session Manager	REPARSE	Desired Access: Query Value, Enumerate Sub Keys
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	Desired Access: Query Value, Enumerate Sub Keys
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\ResourcePolicies	NAME NOT FOUND	Length: 24
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Nls\Sorting\Versions	REPARSE	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Nls\Sorting\Versions	SUCCESS	Desired Access: Read
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Nls\Sorting\Versions\(Default)	SUCCESS	Type: REG_SZ, Length: 18, Data: 00060403
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Nls\Sorting\Versions\000604xx	SUCCESS	Type: REG_SZ, Length: 26, Data: kernel32.dll
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager	REPARSE	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	Desired Access: Query Value
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\SmtDelaySleepLoopWindowSize	NAME NOT FOUND	Length: 80
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\SmtDelaySpinCountThreshold	NAME NOT FOUND	Length: 80
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\SmtDelayBaseYield	NAME NOT FOUND	Length: 80
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\SmtFactorYield	NAME NOT FOUND	Length: 80
+10:48.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Control\Session Manager\SmtDelayMaxYield	NAME NOT FOUND	Length: 80
+10:48.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Session Manager	SUCCESS	
+10:48.0	conv_filter.exe	2592	QueryNameInformationFile	C:\Workspace\OS_labs\Lab2\conv_filter.exe	SUCCESS	Name: \Workspace\OS_labs\Lab2\conv_filter.exe
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 5332
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 22772
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 24992
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 22472
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 5332, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 22772, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 22472, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 24992, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 11640
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 10184
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 25912
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 6400
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 10184, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 25912, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 6400, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 11640, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 24216
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 10384
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 13288
+11:15.8	conv_filter.exe	2592	Thread Create		SUCCESS	Thread ID: 27080
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 24216, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 27080, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 13288, User Time: 0.0000000, Kernel Time: 0.0000000
+11:15.8	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 10384, User Time: 0.0000000, Kernel Time: 0.0000000
+11:16.0	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 27220, User Time: 0.0000000, Kernel Time: 0.0000000
+11:16.0	conv_filter.exe	2592	Thread Exit		SUCCESS	Thread ID: 7156, User Time: 0.0156250, Kernel Time: 0.0156250
+11:16.0	conv_filter.exe	2592	Process Exit		SUCCESS	Exit Status: 0, User Time: 0.0156250 seconds, Kernel Time: 0.0156250 seconds, Private Bytes: 765,952, Peak Private Bytes: 942,080, Working Set: 3,817,472, Peak Working Set: 3,846,144
+11:16.0	conv_filter.exe	2592	RegOpenKey	HKLM\System\CurrentControlSet\Services\bam\State\UserSettings\S-1-5-21-520371964-2323546657-3434994376-1001	SUCCESS	Desired Access: All Access
+11:16.0	conv_filter.exe	2592	RegQueryValue	HKLM\System\CurrentControlSet\Services\bam\State\UserSettings\S-1-5-21-520371964-2323546657-3434994376-1001\\Device\HarddiskVolume5\Workspace\OS_labs\Lab2\conv_filter.exe	NAME NOT FOUND	Length: 40
+11:16.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Services\bam\State\UserSettings\S-1-5-21-520371964-2323546657-3434994376-1001	SUCCESS	
+11:16.0	conv_filter.exe	2592	CloseFile	C:\Workspace\OS_labs\Lab2	SUCCESS	
+11:16.0	conv_filter.exe	2592	RegCloseKey	HKLM\System\CurrentControlSet\Control\Nls\Sorting\Versions	SUCCESS	
+\end{lstlisting}
